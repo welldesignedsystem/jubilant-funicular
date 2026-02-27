@@ -56,10 +56,13 @@ import uuid
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, FastAPI, Path, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi_mcp import FastApiMCP
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from infrastructure import InMemoryUnitOfWork
 from application import (
     # Exceptions
     ApplicationError,
@@ -88,6 +91,10 @@ from application import (
 )
 from model import ChangeType, StageStatus, StakeholderRole
 
+# System user UUID used when no auth is required
+SYSTEM_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
 
 # ---------------------------------------------------------------------------
 # App bootstrap
@@ -104,6 +111,35 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def seed_system_user():
+    """
+    Ensure the SYSTEM_USER stakeholder exists in the in-memory store
+    so all no-auth commands that reference acting_user_id can resolve it.
+    """
+    from infrastructure import InMemoryUnitOfWork
+    from model import Stakeholder
+    uow = InMemoryUnitOfWork()
+    existing = uow.stakeholders.get(SYSTEM_USER_ID)
+    if existing is None:
+        system_user = Stakeholder(
+            id=SYSTEM_USER_ID,
+            full_name="System User",
+            email="system@shipyard.internal",
+            is_active=True,
+        )
+        uow.stakeholders.save(system_user)
+        print(f"[startup] System stakeholder seeded: {SYSTEM_USER_ID}")
 
 
 # ---------------------------------------------------------------------------
@@ -135,34 +171,8 @@ async def value_error_handler(request, exc: ValueError):
 # ---------------------------------------------------------------------------
 
 def get_uow() -> AbstractUnitOfWork:
-    """
-    Provides a Unit of Work instance for the current request.
-    Override this dependency in your infrastructure layer by calling:
-
-        app.dependency_overrides[get_uow] = lambda: MyConcreteUnitOfWork()
-    """
-    raise NotImplementedError(
-        "get_uow() must be overridden with a concrete UnitOfWork. "
-        "See infrastructure/unit_of_work.py."
-    )
-
-
-def get_current_user(
-    authorization: str = Header(..., description="Bearer <token>"),
-    uow: AbstractUnitOfWork = Depends(get_uow),
-) -> uuid.UUID:
-    """
-    Resolve a Bearer token to a Stakeholder UUID.
-    The real implementation should verify a JWT or look up an API key;
-    this stub expects the raw UUID as the token value for easy testing.
-    """
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Invalid Authorization header.")
-    try:
-        return uuid.UUID(token)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Token is not a valid stakeholder UUID.")
+    """Returns the in-memory Unit of Work (no database required)."""
+    return InMemoryUnitOfWork()
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +384,6 @@ stakeholder_router = APIRouter(prefix="/stakeholders", tags=["Stakeholders"])
 def create_stakeholder(
     body: CreateStakeholderRequest,
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Register a new person in the system.  A stakeholder must exist before
@@ -384,7 +393,7 @@ def create_stakeholder(
     cmd = CreateStakeholderCommand(
         full_name=body.full_name,
         email=str(body.email),
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = CreateStakeholderUseCase().execute(cmd, uow)
     return _ok(result)
@@ -396,7 +405,6 @@ def create_stakeholder(
 )
 def list_stakeholders(
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ListStakeholdersUseCase
     result = ListStakeholdersUseCase().execute(uow)
@@ -410,7 +418,6 @@ def list_stakeholders(
 def get_stakeholder(
     stakeholder_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import GetStakeholderUseCase
     result = GetStakeholderUseCase().execute(stakeholder_id, uow)
@@ -432,7 +439,6 @@ project_router = APIRouter(prefix="/projects", tags=["Projects"])
 def create_project(
     body: CreateProjectRequest,
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Creates the project and automatically assigns the requesting user as
@@ -445,7 +451,7 @@ def create_project(
         vessel_type=body.vessel_type,
         planned_start_date=body.planned_start_date,
         planned_end_date=body.planned_end_date,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = CreateProjectUseCase().execute(cmd, uow)
     return _ok(result)
@@ -457,7 +463,6 @@ def create_project(
 )
 def list_projects(
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ListProjectsUseCase
     result = ListProjectsUseCase().execute(uow)
@@ -471,7 +476,6 @@ def list_projects(
 def get_project(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import GetProjectUseCase
     result = GetProjectUseCase().execute(project_id, uow)
@@ -486,15 +490,14 @@ def update_project(
     body: UpdateProjectRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     cmd = UpdateProjectCommand(
         project_id=project_id,
-        acting_user_id=current_user_id,
         name=body.name,
         description=body.description,
         planned_start_date=body.planned_start_date,
         planned_end_date=body.planned_end_date,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = UpdateProjectUseCase().execute(cmd, uow)
     return _ok(result)
@@ -517,7 +520,6 @@ project_stakeholder_router = APIRouter(
 def list_project_stakeholders(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ListProjectStakeholdersUseCase
     result = ListProjectStakeholdersUseCase().execute(project_id, uow)
@@ -533,14 +535,13 @@ def assign_stakeholder(
     body: AssignStakeholderRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import AssignStakeholderUseCase, AssignStakeholderCommand
     cmd = AssignStakeholderCommand(
         project_id=project_id,
         stakeholder_id=body.stakeholder_id,
         role=StakeholderRole(body.role),
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = AssignStakeholderUseCase().execute(cmd, uow)
     return _ok(result)
@@ -555,14 +556,13 @@ def remove_stakeholder(
     body: RemoveStakeholderRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import RemoveStakeholderUseCase, RemoveStakeholderCommand
     cmd = RemoveStakeholderCommand(
         project_id=project_id,
         stakeholder_id=body.stakeholder_id,
         role=StakeholderRole(body.role),
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     RemoveStakeholderUseCase().execute(cmd, uow)
 
@@ -586,7 +586,6 @@ def add_phase(
     body: AddPhaseRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Phases are fully configurable.  Provide an `order` value indicating
@@ -598,7 +597,7 @@ def add_phase(
         name=body.name,
         description=body.description,
         order=body.order,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = AddPhaseUseCase().execute(cmd, uow)
     return _ok(result)
@@ -611,7 +610,6 @@ def add_phase(
 def list_phases(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ListPhasesUseCase
     result = ListPhasesUseCase().execute(project_id, uow)
@@ -626,13 +624,12 @@ def reorder_phases(
     body: ReorderPhasesRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ReorderPhasesUseCase, ReorderPhasesCommand
     cmd = ReorderPhasesCommand(
         project_id=project_id,
         ordered_phase_ids=body.ordered_phase_ids,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = ReorderPhasesUseCase().execute(cmd, uow)
     return _ok(result)
@@ -647,13 +644,12 @@ def remove_phase(
     project_id: uuid.UUID = Path(...),
     phase_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import RemovePhaseUseCase, RemovePhaseCommand
     cmd = RemovePhaseCommand(
         project_id=project_id,
         phase_id=phase_id,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     RemovePhaseUseCase().execute(cmd, uow)
 
@@ -677,7 +673,6 @@ def add_stage(
     body: AddStageRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import AddStageUseCase, AddStageCommand
     cmd = AddStageCommand(
@@ -688,7 +683,7 @@ def add_stage(
         order=body.order,
         planned_start_date=body.planned_start_date,
         planned_end_date=body.planned_end_date,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = AddStageUseCase().execute(cmd, uow)
     return _ok(result)
@@ -702,7 +697,6 @@ def list_stages(
     project_id: uuid.UUID = Path(...),
     phase_id: Optional[uuid.UUID] = Query(default=None, description="Filter by phase"),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ListStagesUseCase
     result = ListStagesUseCase().execute(project_id, uow, phase_id=phase_id)
@@ -717,7 +711,6 @@ def get_stage(
     project_id: uuid.UUID = Path(...),
     stage_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import GetStageUseCase
     result = GetStageUseCase().execute(stage_id, uow)
@@ -733,7 +726,6 @@ def update_stage_schedule(
     project_id: uuid.UUID = Path(...),
     stage_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import UpdateStageScheduleUseCase, UpdateStageScheduleCommand
     cmd = UpdateStageScheduleCommand(
@@ -741,7 +733,7 @@ def update_stage_schedule(
         project_id=project_id,
         planned_start_date=body.planned_start_date,
         planned_end_date=body.planned_end_date,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = UpdateStageScheduleUseCase().execute(cmd, uow)
     return _ok(result)
@@ -756,7 +748,6 @@ def update_stage_progress(
     project_id: uuid.UUID = Path(...),
     stage_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Used by project team members to record actual start/end dates, update
@@ -772,7 +763,7 @@ def update_stage_progress(
         actual_start_date=body.actual_start_date,
         actual_end_date=body.actual_end_date,
         comments=body.comments,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = UpdateStageProgressUseCase().execute(cmd, uow)
     return _ok(result)
@@ -797,7 +788,6 @@ def add_dependency(
     body: AddDependencyRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     The system validates that no circular dependency chain would result.
@@ -808,7 +798,7 @@ def add_dependency(
         project_id=project_id,
         predecessor_stage_id=body.predecessor_stage_id,
         successor_stage_id=body.successor_stage_id,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = AddStageDependencyUseCase().execute(cmd, uow)
     return _ok(result)
@@ -821,7 +811,6 @@ def add_dependency(
 def list_dependencies(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ListStageDependenciesUseCase
     result = ListStageDependenciesUseCase().execute(project_id, uow)
@@ -837,13 +826,12 @@ def remove_dependency(
     project_id: uuid.UUID = Path(...),
     dependency_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import RemoveStageDependencyUseCase, RemoveStageDependencyCommand
     cmd = RemoveStageDependencyCommand(
         project_id=project_id,
         dependency_id=dependency_id,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     RemoveStageDependencyUseCase().execute(cmd, uow)
 
@@ -865,7 +853,6 @@ gantt_router = APIRouter(
 def get_gantt(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Returns all phases and their child stages, including planned/actual/baseline
@@ -896,7 +883,6 @@ def set_initial_baseline(
     body: SetInitialBaselineRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Locks the current planned dates as the approved baseline.  Requires a
@@ -908,7 +894,7 @@ def set_initial_baseline(
         project_id=project_id,
         change_request_id=body.change_request_id,
         notes=body.notes,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = SetInitialBaselineUseCase().execute(cmd, uow)
     return _ok(result)
@@ -923,7 +909,6 @@ def reset_baseline(
     body: ResetBaselineRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Creates a new baseline version, deactivates the previous one, and
@@ -936,7 +921,7 @@ def reset_baseline(
         project_id=project_id,
         change_request_id=body.change_request_id,
         notes=body.notes,
-        acting_user_id=current_user_id,
+        acting_user_id=SYSTEM_USER_ID,
     )
     result = ResetBaselineUseCase().execute(cmd, uow)
     return _ok(result)
@@ -949,7 +934,6 @@ def reset_baseline(
 def list_baselines(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import GetBaselineHistoryUseCase
     result = GetBaselineHistoryUseCase().execute(project_id, uow)
@@ -963,7 +947,6 @@ def list_baselines(
 def get_baseline_report(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Returns: active baseline snapshot per stage with deviation days and
@@ -994,7 +977,6 @@ def submit_change_request(
     body: SubmitChangeRequestRequest,
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     The change request begins in PENDING status.  The designated approver
@@ -1005,15 +987,14 @@ def submit_change_request(
     from application import SubmitChangeRequestUseCase, SubmitChangeRequestCommand
     cmd = SubmitChangeRequestCommand(
         project_id=project_id,
-        requested_by_id=current_user_id,
         approver_id=body.approver_id,
         change_type=ChangeType(body.change_type),
         reason=body.reason,
         schedule_impact_days=body.schedule_impact_days,
         cost_impact=body.cost_impact,
         stakeholder_comments=body.stakeholder_comments,
+        requested_by_id=SYSTEM_USER_ID,
     )
-    result = SubmitChangeRequestUseCase().execute(cmd, uow)
     return _ok(result)
 
 
@@ -1029,7 +1010,6 @@ def list_change_requests(
         description="Filter by status: pending, approved, rejected",
     ),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ListChangeRequestsUseCase
     result = ListChangeRequestsUseCase().execute(
@@ -1046,7 +1026,6 @@ def get_change_request(
     project_id: uuid.UUID = Path(...),
     cr_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import GetChangeRequestUseCase
     result = GetChangeRequestUseCase().execute(cr_id, uow)
@@ -1062,7 +1041,6 @@ def approve_change_request(
     project_id: uuid.UUID = Path(...),
     cr_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Only the designated approver may call this endpoint.  For SCOPE_CHANGE
@@ -1073,10 +1051,9 @@ def approve_change_request(
     cmd = ApproveChangeRequestCommand(
         cr_id=cr_id,
         project_id=project_id,
-        reviewer_id=current_user_id,
         reviewer_comments=body.reviewer_comments,
+        reviewer_id=SYSTEM_USER_ID,
     )
-    result = ApproveChangeRequestUseCase().execute(cmd, uow)
     return _ok(result)
 
 
@@ -1089,17 +1066,15 @@ def reject_change_request(
     project_id: uuid.UUID = Path(...),
     cr_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """Reviewer comments are mandatory when rejecting."""
     from application import RejectChangeRequestUseCase, RejectChangeRequestCommand
     cmd = RejectChangeRequestCommand(
         cr_id=cr_id,
         project_id=project_id,
-        reviewer_id=current_user_id,
         reviewer_comments=body.reviewer_comments,
+        reviewer_id=SYSTEM_USER_ID,
     )
-    result = RejectChangeRequestUseCase().execute(cmd, uow)
     return _ok(result)
 
 
@@ -1120,7 +1095,6 @@ audit_router = APIRouter(
 def get_audit_trail(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     """
     Returns all approved baseline changes in chronological order.  Each entry
@@ -1140,7 +1114,6 @@ def get_audit_trail(
 def export_audit_trail(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import ExportAuditTrailUseCase
     result = ExportAuditTrailUseCase().execute(project_id, uow)
@@ -1164,7 +1137,6 @@ notification_router = APIRouter(
 def get_project_notifications(
     project_id: uuid.UUID = Path(...),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import GetNotificationLogUseCase
     result = GetNotificationLogUseCase().execute(
@@ -1185,11 +1157,11 @@ me_router = APIRouter(prefix="/me", tags=["My Notifications"])
     summary="Get the notification inbox for the authenticated user",
 )
 def get_my_notifications(
+    stakeholder_id: uuid.UUID = Query(..., description="Stakeholder UUID to fetch notifications for"),
     uow: AbstractUnitOfWork = Depends(get_uow),
-    current_user_id: uuid.UUID = Depends(get_current_user),
 ):
     from application import GetMyNotificationsUseCase
-    result = GetMyNotificationsUseCase().execute(current_user_id, uow)
+    result = GetMyNotificationsUseCase().execute(stakeholder_id, uow)
     return _ok(result)
 
 
@@ -1211,6 +1183,13 @@ api_v1.include_router(notification_router)
 api_v1.include_router(me_router)
 
 app.include_router(api_v1)
+
+# ---------------------------------------------------------------------------
+# MCP Server — exposes all API routes as MCP tools
+# Accessible at: http://localhost:8000/mcp
+# ---------------------------------------------------------------------------
+mcp = FastApiMCP(app)
+mcp.mount()
 
 
 # ===========================================================================
