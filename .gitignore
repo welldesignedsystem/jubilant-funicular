@@ -133,3 +133,14 @@ dmypy.json
 .DS_Store
 Thumbs.db
 
+# Node.js (UI folder)
+ui/node_modules/
+ui/dist/
+ui/.env.local
+ui/.env.*.local
+ui/*.log
+ui/npm-debug.log*
+ui/yarn-debug.log*
+ui/yarn-error.log*
+ui/.turbo/
+
